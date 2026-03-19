@@ -4,7 +4,7 @@ A Python-based assistive system that detects objects in real time using YOLOv3,
 retrieves contextual descriptions via the Wikipedia API, and communicates findings
 through text-to-speech audio output and Arduino-controlled servo movement.
 
-This project was built as part of an undergraduate AI degree at SZABIST. The full
+This project was built during my fourth semester part of my Bachelor's in Artificial Intelligence. The full
 system runs on a laptop connected to a physical mannequin fitted with Arduino-controlled
 servo motors and a Bluetooth speaker. The mannequin nods when an object is detected
 and the system speaks a Wikipedia-sourced description aloud.
