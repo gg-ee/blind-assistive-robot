@@ -1,0 +1,284 @@
+"""
+Blind Assistive Robot — Object Detection and Audio Feedback System
+Detects objects in real time using YOLOv3, retrieves contextual descriptions
+via the Wikipedia API, and communicates findings through text-to-speech audio
+output and Arduino-controlled servo movement.
+
+If ARDUINO_PORT is set to None, the system runs in software-only mode —
+detection, Wikipedia lookup, and audio output all function without hardware.
+"""
+
+import time
+import threading
+
+import cv2
+import numpy as np
+import pyttsx3
+import serial
+import wikipedia
+
+# Configuration
+YOLO_WEIGHTS = "yolov3.weights"
+YOLO_CONFIG = "yolov3.cfg"
+COCO_NAMES = "coco.names"
+
+CONFIDENCE_THRESHOLD = 0.5
+NMS_THRESHOLD = 0.4
+INPUT_SIZE = (416, 416)
+
+ARDUINO_PORT = "COM3"       # Set to None to run without hardware
+ARDUINO_BAUD = 9600
+
+DETECTION_INTERVAL = 5      # Seconds between announcements per object
+WIKIPEDIA_SENTENCES = 2     # Sentences to retrieve per detected object
+
+
+# Arduino interface
+class ArduinoController:
+    """
+    Manages serial communication with the Arduino for servo motor control.
+
+    Sends single-character commands over serial:
+        'N' — nod (object detected)
+        'S' — stop / return to neutral
+
+    If port is None, all hardware calls are silently skipped, allowing the
+    detection and audio pipeline to run without physical hardware present.
+    """
+
+    def __init__(self, port: str | None, baud_rate: int):
+        self.port = port
+        self.baud_rate = baud_rate
+        self.connection = None
+
+    def connect(self) -> bool:
+        """Open serial connection to Arduino. Returns True if successful or skipped."""
+        if self.port is None:
+            print("Arduino disabled — running in software-only mode.")
+            return True
+        try:
+            self.connection = serial.Serial(self.port, self.baud_rate, timeout=1)
+            time.sleep(2)  # Allow Arduino to initialise after connection
+            print(f"Arduino connected on {self.port}")
+            return True
+        except serial.SerialException as e:
+            print(f"Arduino connection failed: {e}")
+            return False
+
+    def send_command(self, command: str) -> None:
+        """Send a single-character command to the Arduino if connected."""
+        if self.port is None:
+            return
+        if self.connection and self.connection.is_open:
+            self.connection.write(command.encode())
+
+    def disconnect(self) -> None:
+        """Close the serial connection cleanly."""
+        if self.connection and self.connection.is_open:
+            self.connection.close()
+            print("Arduino disconnected.")
+
+
+# Text-to-speech
+class AudioOutput:
+    """
+    Wraps pyttsx3 for offline text-to-speech output to a connected speaker.
+
+    Speech runs in a daemon thread to avoid blocking the detection loop.
+    """
+
+    def __init__(self):
+        self.engine = pyttsx3.init()
+        self.engine.setProperty("rate", 150)
+
+    def speak(self, text: str) -> None:
+        """Speak text asynchronously so detection continues uninterrupted."""
+        thread = threading.Thread(
+            target=self._speak_blocking, args=(text,), daemon=True
+        )
+        thread.start()
+
+    def _speak_blocking(self, text: str) -> None:
+        self.engine.say(text)
+        self.engine.runAndWait()
+
+
+# YOLO object detector
+class YOLODetector:
+    """
+    Wraps YOLOv3 for real-time object detection using OpenCV's DNN module.
+
+    Loads pre-trained COCO weights and applies non-maximum suppression
+    to filter overlapping bounding boxes before returning detected labels.
+    """
+
+    def __init__(self, weights: str, config: str, names: str):
+        self.net = cv2.dnn.readNet(weights, config)
+        self.class_names = self._load_class_names(names)
+        self.output_layers = self._get_output_layers()
+
+    def _load_class_names(self, path: str) -> list:
+        """Load COCO class labels from file."""
+        with open(path, "r") as f:
+            return [line.strip() for line in f.readlines()]
+
+    def _get_output_layers(self) -> list:
+        """Retrieve the names of YOLO output layers for forward pass."""
+        layer_names = self.net.getLayerNames()
+        return [layer_names[i - 1] for i in self.net.getUnconnectedOutLayers()]
+
+    def detect(self, frame: np.ndarray) -> list:
+        """
+        Run detection on a single frame.
+
+        Returns a list of detected class name strings above the confidence
+        threshold, after non-maximum suppression removes duplicate detections.
+        """
+        blob = cv2.dnn.blobFromImage(
+            frame, 1 / 255.0, INPUT_SIZE, swapRB=True, crop=False
+        )
+        self.net.setInput(blob)
+        outputs = self.net.forward(self.output_layers)
+
+        boxes, confidences, class_ids = [], [], []
+        height, width = frame.shape[:2]
+
+        for output in outputs:
+            for detection in output:
+                scores = detection[5:]
+                class_id = int(np.argmax(scores))
+                confidence = float(scores[class_id])
+
+                if confidence > CONFIDENCE_THRESHOLD:
+                    cx, cy, w, h = (
+                        detection[:4] * np.array([width, height, width, height])
+                    ).astype(int)
+                    x = cx - w // 2
+                    y = cy - h // 2
+                    boxes.append([x, y, w, h])
+                    confidences.append(confidence)
+                    class_ids.append(class_id)
+
+        indices = cv2.dnn.NMSBoxes(
+            boxes, confidences, CONFIDENCE_THRESHOLD, NMS_THRESHOLD
+        )
+        detected = []
+
+        if len(indices) > 0:
+            for i in indices.flatten():
+                detected.append(self.class_names[class_ids[i]])
+
+        return detected
+
+
+# Wikipedia lookup
+
+def fetch_wikipedia_summary(query: str, sentences: int = WIKIPEDIA_SENTENCES) -> str:
+    """
+    Fetch a short Wikipedia summary for a detected object label.
+
+    Returns a fallback string if the article is not found or is ambiguous.
+    Disambiguation is resolved by taking the first suggested alternative.
+    """
+    try:
+        return wikipedia.summary(query, sentences=sentences, auto_suggest=False)
+    except wikipedia.exceptions.DisambiguationError as e:
+        try:
+            return wikipedia.summary(e.options[0], sentences=sentences, auto_suggest=False)
+        except Exception:
+            return f"Multiple results found for {query}."
+    except wikipedia.exceptions.PageError:
+        return f"No Wikipedia article found for {query}."
+    except Exception as e:
+        return f"Could not retrieve information: {e}"
+
+
+# Background fetch and speak
+def fetch_and_speak(obj: str, audio: AudioOutput, arduino: ArduinoController) -> None:
+    """
+    Fetch a Wikipedia summary for a detected object and speak it aloud.
+
+    Runs in a background thread so the detection loop is not blocked
+    by network latency from the Wikipedia API call.
+    Triggers an Arduino nod command after the description is retrieved.
+    """
+    summary = fetch_wikipedia_summary(obj)
+    message = f"I can see a {obj}. {summary}"
+    print(f"[Detected] {obj}")
+    audio.speak(message)
+    arduino.send_command("N")
+
+
+# Main detection loop
+def run_assistant(
+    arduino: ArduinoController,
+    audio: AudioOutput,
+    detector: YOLODetector,
+) -> None:
+    """
+    Main loop: captures webcam frames, detects objects, retrieves descriptions,
+    triggers servo movement, and speaks results aloud.
+
+    Tracks recently announced objects to avoid repeating the same description
+    within the DETECTION_INTERVAL window.
+    """
+    cap = cv2.VideoCapture(0)
+
+    if not cap.isOpened():
+        print("Error: Could not open webcam.")
+        return
+
+    print("Assistant running. Press 'q' to quit.")
+    last_announced = {}  # Maps object label to timestamp of last announcement
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("Error: Failed to read frame.")
+            break
+
+        detected_objects = detector.detect(frame)
+        current_time = time.time()
+
+        for obj in set(detected_objects):
+            last_time = last_announced.get(obj, 0)
+
+            if current_time - last_time > DETECTION_INTERVAL:
+                last_announced[obj] = current_time
+                thread = threading.Thread(
+                    target=fetch_and_speak,
+                    args=(obj, audio, arduino),
+                    daemon=True,
+                )
+                thread.start()
+
+        cv2.imshow("Blind Assistant — Press Q to quit", frame)
+
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+# Entry point
+def main():
+    """Initialise all components and start the assistant."""
+    arduino = ArduinoController(port=ARDUINO_PORT, baud_rate=ARDUINO_BAUD)
+    audio = AudioOutput()
+    detector = YOLODetector(
+        weights=YOLO_WEIGHTS,
+        config=YOLO_CONFIG,
+        names=COCO_NAMES,
+    )
+
+    arduino.connect()
+
+    try:
+        run_assistant(arduino, audio, detector)
+    finally:
+        arduino.disconnect()
+
+
+if __name__ == "__main__":
+    main()
